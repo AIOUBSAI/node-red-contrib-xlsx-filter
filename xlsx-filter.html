@@ -1,0 +1,516 @@
+<!-- Compact single-column editor -->
+<style>
+  .nrdb-xlsx-filter .form-row label{display:block;width:100%;margin-bottom:4px}
+  .nrdb-xlsx-filter .form-row input[type="text"],
+  .nrdb-xlsx-filter .form-row select{width:100%!important;box-sizing:border-box}
+  .nrdb-xlsx-filter .checkbox-row{display:flex;align-items:center;gap:8px;padding:4px 0}
+  .nrdb-xlsx-filter .checkbox-row label{display:flex;align-items:center;gap:6px;margin:0;white-space:nowrap}
+  .nrdb-xlsx-filter .checkbox-row input[type="checkbox"]{margin:0}
+  .nrdb-xlsx-filter .inline-pair{display:flex;gap:8px}
+  .nrdb-xlsx-filter .inline-pair>*{flex:1}
+  .nrdb-xlsx-filter table{width:100%}
+  .nrdb-xlsx-filter .rules-head th,
+  .nrdb-xlsx-filter .derive-head th,
+  .nrdb-xlsx-filter .select-head th,
+  .nrdb-xlsx-filter .rename-head th{font-weight:600}
+</style>
+
+<script type="text/javascript">
+RED.nodes.registerType('xlsx-filter', {
+  category: 'function',
+  color: '#C7E9B4',
+  icon: "filter.png",
+  defaults: {
+    name: { value: "" },
+
+    // INPUT
+    inputPath:     { value: "data" },
+    inputPathType: { value: "msg" },
+
+    // SHEET filters (file scope removed)
+    includeSheetRegex: { value: "" },
+    excludeSheetRegex: { value: "" },
+
+    // FILTER rules (sheet-scoped)
+    filterLogic: { value: "AND" },
+    rules:       { value: [] },
+
+    // SELECT (sheet-scoped)
+    selectMode: { value: "none" }, // none|keep|drop
+    selectList: { value: [] },     // [{sheetScope,sheetScopeType,col,colType}]
+
+    // RENAME (sheet-scoped)
+    renameList: { value: [] },     // [{sheetScope,sheetScopeType,from,fromType,to,toType}]
+
+    // CONDITIONAL RENAME
+    conditionalRenameEnabled:       { value: false },
+    conditionalRenameWhenLhsType:   { value: "msg" },
+    conditionalRenameWhenLhs:       { value: "" },
+    conditionalRenameOp:            { value: "==" },
+    conditionalRenameRhsType:       { value: "str" },
+    conditionalRenameRhs:           { value: "" },
+    conditionalRenameList:          { value: [] },
+
+    // DERIVE
+    deriveList: { value: [] },
+
+    // OUTPUT
+    outputTargetType: { value: "msg" },
+    outputTargetPath: { value: "filtered" },
+    structure:        { value: "hierarchical" },
+    includeSummary:   { value: true }
+  },
+  inputs: 1,
+  outputs: 1,
+  label: function(){ return this.name || "xlsx-filter"; },
+
+  oneditprepare: function () {
+    const self = this;
+
+    // Input/Output typedInputs
+    $("#node-input-inputPath").typedInput({
+      default:'msg', types:['msg','flow','global'],
+      typeField:$("#node-input-inputPathType")
+    });
+    $("#node-input-outputTargetPath").typedInput({
+      default:'msg', types:['msg','flow','global'],
+      typeField:$("#node-input-outputTargetType")
+    });
+
+    // ---------- RULES (sheet-scoped) ----------
+    const rulesBody = $("#xf-rules tbody").empty();
+    function addRuleRow(d) {
+      const row = $(`
+        <tr>
+          <td><input class="xf-sheet"><input type="hidden" class="xf-sheetType"></td>
+          <td><input class="xf-col"><input type="hidden" class="xf-colType"></td>
+          <td>
+            <select class="xf-op">
+              <option value="==">==</option>
+              <option value="!=">!=</option>
+              <option value="<"><</option>
+              <option value="<="><=</option>
+              <option value=">">></option>
+              <option value=">=">>=</option>
+              <option value="contains">contains</option>
+              <option value="!contains">!contains</option>
+              <option value="regex">regex</option>
+              <option value="isEmpty">isEmpty</option>
+              <option value="!isEmpty">!isEmpty</option>
+              <option value="jsonata">JSONata (expr)</option>
+            </select>
+          </td>
+          <td><input class="xf-rhs"><input type="hidden" class="xf-rhsType"></td>
+          <td style="text-align:center"><input type="checkbox" class="xf-case"></td>
+          <td style="text-align:center"><input type="checkbox" class="xf-coerce" checked></td>
+          <td style="text-align:center"><button class="red-ui-button red-ui-button-small xf-del"><i class="fa fa-trash"></i></button></td>
+        </tr>
+      `);
+
+      // Sheet scope
+      const sheet = $(".xf-sheet", row), sheetT = $(".xf-sheetType", row);
+      sheet.typedInput({ default:'str', types:['str','regex','jsonata'], typeField:sheetT });
+      sheet.typedInput('value', d?.sheetScope || "");
+      sheet.typedInput('type',  d?.sheetScopeType || 'str');
+
+      // Column
+      const col = $(".xf-col", row), colT = $(".xf-colType", row);
+      col.typedInput({ default:'str', types:['str','msg','flow','global','env','jsonata'], typeField:colT });
+      col.typedInput('value', d?.col || "");
+      col.typedInput('type',  d?.colType || 'str');
+
+      // Op/Case/Coerce
+      $(".xf-op", row).val(d?.op || "==");
+      $(".xf-case", row).prop("checked", !!d?.caseSensitive);
+      $(".xf-coerce", row).prop("checked", d?.coerce !== false);
+
+      // RHS
+      const rhs = $(".xf-rhs", row), rhsT = $(".xf-rhsType", row);
+      rhs.typedInput({ default:'str', types:['str','num','bool','msg','flow','global','env','jsonata'], typeField:rhsT });
+      rhs.typedInput('value', d?.rhs || "");
+      rhs.typedInput('type',  d?.rhsType || 'str');
+
+      function refreshByOp(){
+        const isJ = $(".xf-op", row).val()==="jsonata";
+        col.prop("disabled", isJ);
+        $(".xf-case", row).closest('td').css("opacity", isJ?0.3:1);
+        $(".xf-coerce", row).closest('td').css("opacity", isJ?0.3:1);
+        if (isJ) rhs.typedInput('type','jsonata');
+      }
+      $(".xf-op", row).on("change", refreshByOp); refreshByOp();
+
+      $(".xf-del", row).on("click", ()=>row.remove());
+      rulesBody.append(row);
+    }
+    (self.rules||[]).forEach(addRuleRow);
+    $("#xf-add-rule").on("click", ()=>addRuleRow({}));
+
+    // ---------- SELECT (sheet-scoped) ----------
+    $("#node-input-selectMode").val(self.selectMode || "none");
+    const selBody = $("#xf-select tbody").empty();
+    function addSelectRow(d){
+      const row = $(`
+        <tr>
+          <td><input class="xs-sheet"><input type="hidden" class="xs-sheetType"></td>
+          <td><input class="xs-col"><input type="hidden" class="xs-colType"></td>
+          <td style="text-align:center"><button class="red-ui-button red-ui-button-small xs-del"><i class="fa fa-trash"></i></button></td>
+        </tr>
+      `);
+      const sheet = $(".xs-sheet", row), sheetT = $(".xs-sheetType", row);
+      sheet.typedInput({ default:'str', types:['str','regex','jsonata'], typeField:sheetT });
+      sheet.typedInput('value', d?.sheetScope || "");
+      sheet.typedInput('type',  d?.sheetScopeType || 'str');
+
+      const col = $(".xs-col", row), colT = $(".xs-colType", row);
+      col.typedInput({ default:'str', types:['str','msg','flow','global','env','jsonata'], typeField:colT });
+      col.typedInput('value', d?.col || "");
+      col.typedInput('type',  d?.colType || 'str');
+
+      $(".xs-del", row).on("click", ()=>row.remove());
+      selBody.append(row);
+    }
+    (self.selectList||[]).forEach(addSelectRow);
+    $("#xf-add-select").on("click", ()=>addSelectRow({}));
+
+    // ---------- RENAME (sheet-scoped) ----------
+    const rnBody = $("#xf-rename tbody").empty();
+    function addRenameRow(d){
+      const row = $(`
+        <tr>
+          <td><input class="xr-sheet"><input type="hidden" class="xr-sheetType"></td>
+          <td><input class="xr-from"><input type="hidden" class="xr-fromType"></td>
+          <td><input class="xr-to"><input type="hidden" class="xr-toType"></td>
+          <td style="text-align:center"><button class="red-ui-button red-ui-button-small xr-del"><i class="fa fa-trash"></i></button></td>
+        </tr>
+      `);
+      const sheet = $(".xr-sheet", row), sheetT = $(".xr-sheetType", row);
+      sheet.typedInput({ default:'str', types:['str','regex','jsonata'], typeField:sheetT });
+      sheet.typedInput('value', d?.sheetScope || "");
+      sheet.typedInput('type',  d?.sheetScopeType || 'str');
+
+      const from = $(".xr-from", row), fromT = $(".xr-fromType", row);
+      from.typedInput({ default:'str', types:['str','msg','flow','global','env','jsonata'], typeField:fromT });
+      from.typedInput('value', d?.from || "");
+      from.typedInput('type',  d?.fromType || 'str');
+
+      const to = $(".xr-to", row), toT = $(".xr-toType", row);
+      to.typedInput({ default:'str', types:['str','msg','flow','global','env','jsonata'], typeField:toT });
+      to.typedInput('value', d?.to || "");
+      to.typedInput('type',  d?.toType || 'str');
+
+      $(".xr-del", row).on("click", ()=>row.remove());
+      rnBody.append(row);
+    }
+    (self.renameList||[]).forEach(addRenameRow);
+    $("#xf-add-rename").on("click", ()=>addRenameRow({}));
+
+    // ---------- CONDITIONAL RENAME ----------
+    $("#node-input-conditionalRenameWhenLhs").typedInput({
+      default:'msg', types:['msg','flow','global','jsonata'],
+      typeField:$("#node-input-conditionalRenameWhenLhsType")
+    });
+    $("#node-input-conditionalRenameRhs").typedInput({
+      default:'str', types:['str','num','bool','msg','flow','global','env','jsonata'],
+      typeField:$("#node-input-conditionalRenameRhsType")
+    });
+
+    const crBody = $("#xf-crename tbody").empty();
+    function addCRow(d){
+      const row = $(`
+        <tr>
+          <td><input class="xc-sheet"><input type="hidden" class="xc-sheetType"></td>
+          <td><input class="xc-from"><input type="hidden" class="xc-fromType"></td>
+          <td><input class="xc-to"><input type="hidden" class="xc-toType"></td>
+          <td style="text-align:center"><button class="red-ui-button red-ui-button-small xc-del"><i class="fa fa-trash"></i></button></td>
+        </tr>
+      `);
+      const sheet = $(".xc-sheet", row), sheetT = $(".xc-sheetType", row);
+      sheet.typedInput({ default:'str', types:['str','regex','jsonata'], typeField:sheetT });
+      sheet.typedInput('value', d?.sheetScope || "");
+      sheet.typedInput('type',  d?.sheetScopeType || 'str');
+
+      const from = $(".xc-from", row), fromT = $(".xc-fromType", row);
+      from.typedInput({ default:'str', types:['str','msg','flow','global','env','jsonata'], typeField:fromT });
+      from.typedInput('value', d?.from || "");
+      from.typedInput('type',  d?.fromType || 'str');
+
+      const to = $(".xc-to", row), toT = $(".xc-toType", row);
+      to.typedInput({ default:'str', types:['str','msg','flow','global','env','jsonata'], typeField:toT });
+      to.typedInput('value', d?.to || "");
+      to.typedInput('type',  d?.toType || 'str');
+
+      $(".xc-del", row).on("click", ()=>row.remove());
+      crBody.append(row);
+    }
+    (self.conditionalRenameList||[]).forEach(addCRow);
+    $("#xf-add-crename").on("click", ()=>addCRow({}));
+
+    function setConditionalUIEnabled(enabled){
+      const $lhs = $("#node-input-conditionalRenameWhenLhs");
+      const $rhs = $("#node-input-conditionalRenameRhs");
+      const $op  = $("#node-input-conditionalRenameOp");
+
+      // native disable
+      [$op].forEach($el => $el.prop("disabled", !enabled));
+      // typedInputs enable/disable (also disables the type dropdowns)
+      enabled ? $lhs.typedInput('enable') : $lhs.typedInput('disable');
+      enabled ? $rhs.typedInput('enable') : $rhs.typedInput('disable');
+
+      // table + add button
+      $("#xf-add-crename").prop("disabled", !enabled);
+      $("#xf-crename input, #xf-crename button").prop("disabled", !enabled);
+      $("#xf-crename").css("opacity", enabled ? 1 : 0.5);
+    }
+    const $chk = $("#node-input-conditionalRenameEnabled");
+    setConditionalUIEnabled($chk.is(":checked"));
+    $chk.on("change", ()=>setConditionalUIEnabled($chk.is(":checked")));
+  },
+
+  oneditsave: function () {
+    // FILTER rules
+    const rules=[];
+    $("#xf-rules tbody tr").each(function(){
+      rules.push({
+        sheetScope: $(".xf-sheet", this).typedInput('value') || "",
+        sheetScopeType: $(".xf-sheetType", this).val() || "str",
+        col: $(".xf-col", this).typedInput('value') || "",
+        colType: $(".xf-colType", this).val() || "str",
+        op: $(".xf-op", this).val() || "==",
+        rhsType: $(".xf-rhsType", this).val() || "str",
+        rhs: $(".xf-rhs", this).typedInput('value') || "",
+        caseSensitive: $(".xf-case", this).is(":checked"),
+        coerce: $(".xf-coerce", this).is(":checked")
+      });
+    });
+    this.rules = rules;
+
+    // SELECT
+    this.selectMode = $("#node-input-selectMode").val() || "none";
+    const selectList=[];
+    $("#xf-select tbody tr").each(function(){
+      selectList.push({
+        sheetScope: $(".xs-sheet", this).typedInput('value') || "",
+        sheetScopeType: $(".xs-sheetType", this).val() || "str",
+        col: $(".xs-col", this).typedInput('value') || "",
+        colType: $(".xs-colType", this).val() || "str"
+      });
+    });
+    this.selectList = selectList;
+
+    // RENAME
+    const renameList=[];
+    $("#xf-rename tbody tr").each(function(){
+      renameList.push({
+        sheetScope: $(".xr-sheet", this).typedInput('value') || "",
+        sheetScopeType: $(".xr-sheetType", this).val() || "str",
+        from: $(".xr-from", this).typedInput('value') || "",
+        fromType: $(".xr-fromType", this).val() || "str",
+        to: $(".xr-to", this).typedInput('value') || "",
+        toType: $(".xr-toType", this).val() || "str"
+      });
+    });
+    this.renameList = renameList;
+
+    // CONDITIONAL RENAME list
+    const crList=[];
+    $("#xf-crename tbody tr").each(function(){
+      crList.push({
+        sheetScope: $(".xc-sheet", this).typedInput('value') || "",
+        sheetScopeType: $(".xc-sheetType", this).val() || "str",
+        from: $(".xc-from", this).typedInput('value') || "",
+        fromType: $(".xc-fromType", this).val() || "str",
+        to: $(".xc-to", this).typedInput('value') || "",
+        toType: $(".xc-toType", this).val() || "str"
+      });
+    });
+    this.conditionalRenameList = crList;
+  }
+});
+</script>
+
+<!-- Template -->
+<script type="text/x-red" data-template-name="xlsx-filter">
+  <div class="nrdb-xlsx-filter">
+    <div class="form-row">
+      <label for="node-input-name"><i class="fa fa-tag"></i> Name</label>
+      <input type="text" id="node-input-name" placeholder="Name">
+    </div>
+
+    <div class="form-row">
+      <label for="node-input-inputPath"><i class="fa fa-sign-in"></i> Input (msg/flow/global + path)</label>
+      <input type="text" id="node-input-inputPath" placeholder="e.g., data">
+      <input type="hidden" id="node-input-inputPathType">
+    </div>
+
+    <div class="form-row">
+      <label><i class="fa fa-table"></i> Sheet filters</label>
+      <div class="inline-pair">
+        <input type="text" id="node-input-includeSheetRegex" placeholder="Include regex">
+        <input type="text" id="node-input-excludeSheetRegex" placeholder="Exclude regex">
+      </div>
+    </div>
+
+    <div class="form-row">
+      <label for="node-input-filterLogic"><i class="fa fa-filter"></i> Row filters</label>
+      <select id="node-input-filterLogic">
+        <option value="AND">AND</option>
+        <option value="OR">OR</option>
+      </select>
+    </div>
+
+    <div class="form-row">
+      <table id="xf-rules">
+        <thead class="rules-head">
+          <tr>
+            <th>Sheet</th>
+            <th>Column</th>
+            <th>Op</th>
+            <th>RHS</th>
+            <th>Case</th>
+            <th>Coerce</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+      <div style="margin-top:6px">
+        <button class="red-ui-button" id="xf-add-rule"><i class="fa fa-plus"></i> Add rule</button>
+      </div>
+      <p class="form-tips">Select Op=<b>JSONata</b> to evaluate a boolean expression per row; otherwise use Column + comparator + RHS. Column and RHS support str/msg/flow/global/env/JSONata.</p>
+    </div>
+
+    <div class="form-row">
+      <label for="node-input-selectMode"><i class="fa fa-columns"></i> Select columns (sheet-scoped)</label>
+      <select id="node-input-selectMode">
+        <option value="none">None</option>
+        <option value="keep">Keep list</option>
+        <option value="drop">Drop list</option>
+      </select>
+      <table id="xf-select" style="margin-top:6px">
+          <colgroup>
+          <col style="width: 32%">
+          <col style="width: 63%">
+          <col style="width: 5%">
+        </colgroup>
+        <thead class="select-head">
+          <tr>
+            <th>Sheet</th>
+            <th>Column</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+      <div style="margin-top:6px">
+        <button class="red-ui-button" id="xf-add-select"><i class="fa fa-plus"></i> Add column</button>
+      </div>
+    </div>
+
+    <div class="form-row">
+      <label><i class="fa fa-exchange"></i> Rename map (sheet-scoped)</label>
+      <table id="xf-rename">
+        <thead class="rename-head">
+          <tr>
+            <th>Sheet</th>
+            <th>From</th>
+            <th>To</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+      <div style="margin-top:6px">
+        <button class="red-ui-button" id="xf-add-rename"><i class="fa fa-plus"></i> Add rename</button>
+      </div>
+    </div>
+
+    <div class="form-row">
+      <div class="checkbox-row" style="margin-top:8px">
+        <label for="node-input-conditionalRenameEnabled"><i class="fa fa-random"></i> Conditional rename</label>
+        <input type="checkbox" id="node-input-conditionalRenameEnabled">
+      </div>
+      <div class="inline-pair">
+        <input type="text" id="node-input-conditionalRenameWhenLhs" placeholder="lhs path or JSONata expr">
+        <input type="hidden" id="node-input-conditionalRenameWhenLhsType">
+      </div>
+      <div class="inline-pair" style="margin-top:6px">
+        <select id="node-input-conditionalRenameOp">
+          <option value="==">==</option>
+          <option value="!=">!=</option>
+          <option value="contains">contains</option>
+          <option value="!contains">!contains</option>
+          <option value="regex">regex</option>
+          <option value="isEmpty">isEmpty</option>
+          <option value="!isEmpty">!isEmpty</option>
+        </select>
+        <input type="text" id="node-input-conditionalRenameRhs" placeholder="rhs value or JSONata expr">
+        <input type="hidden" id="node-input-conditionalRenameRhsType">
+      </div>
+
+      <table id="xf-crename" style="margin-top:6px">
+        <thead class="rename-head">
+          <tr>
+            <th>Sheet</th>
+            <th>From</th>
+            <th>To</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+      <div style="margin-top:6px">
+        <button class="red-ui-button" id="xf-add-crename"><i class="fa fa-plus"></i> Add conditional rename</button>
+      </div>
+    </div>
+
+    <div class="form-row">
+      <label><i class="fa fa-plus-square"></i> Derive columns</label>
+      <table id="xd-derive">
+        <thead class="derive-head">
+          <tr>
+            <th>New column</th>
+            <th>Expr type</th>
+            <th>Expression</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+      <div style="margin-top:6px">
+        <button class="red-ui-button" id="xd-add-derive"><i class="fa fa-plus"></i> Add derived column</button>
+      </div>
+    </div>
+
+    <div class="form-row">
+      <label for="node-input-outputTargetPath"><i class="fa fa-sign-out"></i> Output (msg/flow/global + path)</label>
+      <input type="text" id="node-input-outputTargetPath" placeholder="e.g., filtered">
+      <input type="hidden" id="node-input-outputTargetType">
+    </div>
+
+    <div class="form-row">
+      <label for="node-input-structure"><i class="fa fa-sitemap"></i> Structure</label>
+      <select id="node-input-structure">
+        <option value="hierarchical">Hierarchical</option>
+        <option value="flat">Flat (adds _sheet/_file)</option>
+      </select>
+    </div>
+
+    <div class="form-row">
+      <div class="checkbox-row">
+        <label for="node-input-includeSummary"><i class="fa fa-info-circle"></i> Include summary</label>
+        <input type="checkbox" id="node-input-includeSummary">
+      </div>
+    </div>
+  </div>
+</script>
+
+<!-- Help -->
+<script type="text/x-red" data-help-name="xlsx-filter">
+  <p><b>XLSX Filter</b> filters rows and transforms columns in the aggregated output of xlsx-reader.</p>
+  <ul>
+    <li><b>Row filters:</b> Sheet scope + Column (typed) + comparator + RHS (typed). JSONata op evaluates per-row.</li>
+    <li><b>Select columns:</b> Choose keep/drop and add <b>sheet-scoped</b>, dynamic column entries (str/msg/flow/global/env/JSONata).</li>
+    <li><b>Rename:</b> Add sheet-scoped mappings; From/To are dynamic. Conditional rename toggles the entire section.</li>
+    <li><b>Processing order:</b> <code>filters → select → rename → conditional rename → derive</code>.</li>
+  </ul>
+</script>
