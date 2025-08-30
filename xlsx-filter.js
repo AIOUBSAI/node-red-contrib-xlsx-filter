@@ -1,52 +1,272 @@
+const fs = require("fs");
 const path = require("path");
 
+// --------- small utils shared by endpoints & runtime ----------
+function nowISOString() {
+  return new Date().toISOString();
+}
+
+function deepClone(obj) {
+  return JSON.parse(JSON.stringify(obj || {}));
+}
+
+function withDefaults(schema = {}) {
+  // Ensure a complete schema shape with defaults
+  return {
+    inputPath: schema.inputPath ?? "data",
+    inputPathType: schema.inputPathType ?? "msg",
+
+    includeSheetRegex: schema.includeSheetRegex ?? "",
+    excludeSheetRegex: schema.excludeSheetRegex ?? "",
+
+    filterLogic: schema.filterLogic ?? "AND",
+    rules: Array.isArray(schema.rules) ? schema.rules : [],
+
+    selectMode: schema.selectMode ?? "none",
+    selectList: Array.isArray(schema.selectList) ? schema.selectList : [],
+
+    renameList: Array.isArray(schema.renameList) ? schema.renameList : [],
+
+    conditionalRename: {
+      enabled: schema.conditionalRename?.enabled ?? false,
+      whenLhsType: schema.conditionalRename?.whenLhsType ?? "msg",
+      whenLhs: schema.conditionalRename?.whenLhs ?? "",
+      op: schema.conditionalRename?.op ?? "==",
+      rhsType: schema.conditionalRename?.rhsType ?? "str",
+      rhs: schema.conditionalRename?.rhs ?? "",
+      list: Array.isArray(schema.conditionalRename?.list) ? schema.conditionalRename.list : []
+    },
+
+    deriveList: Array.isArray(schema.deriveList) ? schema.deriveList : [],
+
+    output: {
+      targetType: schema.output?.targetType ?? "msg",
+      targetPath: schema.output?.targetPath ?? "filtered",
+      structure: schema.output?.structure ?? "hierarchical",
+      includeSummary: schema.output?.includeSummary ?? true
+    }
+  };
+}
+
+function makeTemplateJSON() {
+  return {
+    version: 1,
+    updatedAt: nowISOString(),
+    schema: withDefaults({})
+  };
+}
+
 module.exports = function(RED) {
+
+  // -------------------- Admin HTTP endpoints --------------------
+  // Path handling: relative paths resolved under userDir; no traversal outside; .json only
+  function resolveSafePath(rawPath) {
+    if (!rawPath || typeof rawPath !== "string") {
+      const err = new Error("Invalid config file path.");
+      err.status = 400; throw err;
+    }
+    const userDir = RED.settings.userDir || process.cwd();
+    const normalized = path.normalize(rawPath);
+
+    const abs = path.isAbsolute(normalized)
+      ? normalized
+      : path.join(userDir, normalized);
+
+    const rel = path.relative(userDir, abs);
+    if (rel.startsWith("..") || path.isAbsolute(rel)) {
+      const err = new Error("Path is outside userDir.");
+      err.status = 400; throw err;
+    }
+    if (path.extname(abs).toLowerCase() !== ".json") {
+      const err = new Error("Config file must have .json extension.");
+      err.status = 400; throw err;
+    }
+    return abs;
+  }
+
+  // GET: read config JSON
+  RED.httpAdmin.get("/xlsx-filter/config", async function(req, res) {
+    try {
+      const p = resolveSafePath(req.query.path);
+      if (!fs.existsSync(p)) {
+        return res.status(404).json({ missing: true, message: "Config file not found." });
+      }
+      const txt = fs.readFileSync(p, "utf8");
+      const json = JSON.parse(txt);
+      return res.json(json);
+    } catch (e) {
+      const status = e.status || 500;
+      return res.status(status).json({ error: String(e.message || e) });
+    }
+  });
+
+  // POST: write config JSON (pretty)
+  RED.httpAdmin.post("/xlsx-filter/config", async function(req, res) {
+    try {
+      const body = req.body || {};
+      const p = resolveSafePath(body.path);
+      const data = body.data;
+      if (!data || typeof data !== "object") {
+        const err = new Error("Missing or invalid data.");
+        err.status = 400; throw err;
+      }
+      const toWrite = deepClone(data);
+      // stamp updatedAt if not present
+      if (!toWrite.updatedAt) toWrite.updatedAt = nowISOString();
+      fs.mkdirSync(path.dirname(p), { recursive: true });
+      fs.writeFileSync(p, JSON.stringify(toWrite, null, 2), "utf8");
+      return res.json({ ok: true, path: p });
+    } catch (e) {
+      const status = e.status || 500;
+      return res.status(status).json({ error: String(e.message || e) });
+    }
+  });
+
+  // POST: create template if missing
+  RED.httpAdmin.post("/xlsx-filter/config/template", async function(req, res) {
+    try {
+      const body = req.body || {};
+      const p = resolveSafePath(body.path);
+      if (fs.existsSync(p)) {
+        return res.status(409).json({ exists: true, message: "File already exists." });
+      }
+      fs.mkdirSync(path.dirname(p), { recursive: true });
+      const tmpl = makeTemplateJSON();
+      fs.writeFileSync(p, JSON.stringify(tmpl, null, 2), "utf8");
+      return res.json({ ok: true, path: p, created: true, data: tmpl });
+    } catch (e) {
+      const status = e.status || 500;
+      return res.status(status).json({ error: String(e.message || e) });
+    }
+  });
+
+  // -------------------- Node implementation --------------------
   function XlsxFilterNode(config) {
     RED.nodes.createNode(this, config);
     const node = this;
 
-    // INPUT
-    node.inputPath = config.inputPath || "data";
-    node.inputPathType = config.inputPathType || "msg"; // msg|flow|global
-    node.includeSheetRegex = config.includeSheetRegex || "";
-    node.excludeSheetRegex = config.excludeSheetRegex || "";
+    // New config-file options
+    node.useConfigFile   = !!config.useConfigFile;
+    node.configFilePath  = config.configFilePath || "";
+    node.lockToFile      = !!config.lockToFile;
+    node.watchConfigFile = !!config.watchConfigFile;
 
-    // FILTERS (sheet-scoped)
-    node.filterLogic = config.filterLogic || "AND";
-    node.rules = Array.isArray(config.rules) ? config.rules : []; // [{sheetScope,sheetScopeType,col,colType,op,rhsType,rhs,caseSensitive,coerce}]
+    node._watcher = null;
+    node.rt = null; // runtime schema (withDefaults), used by processing
 
-    // SELECT (keep/drop) — sheet-scoped, dynamic column names (string or array)
-    node.selectMode  = config.selectMode || "none"; // none|keep|drop
-    node.selectList  = Array.isArray(config.selectList) ? config.selectList : []; // [{sheetScope,sheetScopeType,col,colType}]
+    // Build runtime schema from embedded editor config (fallback/default)
+    function embeddedToSchemaObj() {
+      return withDefaults({
+        inputPath: config.inputPath || "data",
+        inputPathType: config.inputPathType || "msg",
 
-    // RENAME (sheet-scoped) — supports scalar or arrays
-    node.renameList  = Array.isArray(config.renameList) ? config.renameList : []; // [{sheetScope,sheetScopeType,from,fromType,to,toType}]
+        includeSheetRegex: config.includeSheetRegex || "",
+        excludeSheetRegex: config.excludeSheetRegex || "",
 
-    // CONDITIONAL RENAME (message-level condition + sheet-scoped list) — supports arrays
-    node.conditionalRenameEnabled     = !!config.conditionalRenameEnabled;
-    node.conditionalRenameWhenLhsType = config.conditionalRenameWhenLhsType || "msg";
-    node.conditionalRenameWhenLhs     = config.conditionalRenameWhenLhs || "";
-    node.conditionalRenameOp          = config.conditionalRenameOp || "==";
-    node.conditionalRenameRhsType     = config.conditionalRenameRhsType || "str";
-    node.conditionalRenameRhs         = config.conditionalRenameRhs || "";
-    node.conditionalRenameList        = Array.isArray(config.conditionalRenameList) ? config.conditionalRenameList : [];
+        filterLogic: config.filterLogic || "AND",
+        rules: Array.isArray(config.rules) ? config.rules : [],
 
-    // DERIVE
-    node.deriveList = Array.isArray(config.deriveList) ? config.deriveList : [];
+        selectMode: config.selectMode || "none",
+        selectList: Array.isArray(config.selectList) ? config.selectList : [],
 
-    // OUTPUT
-    node.outputTargetType = config.outputTargetType || "msg";
-    node.outputTargetPath = config.outputTargetPath || "filtered";
-    node.structure        = config.structure || "hierarchical"; // hierarchical|flat
-    node.includeSummary   = config.hasOwnProperty("includeSummary") ? !!config.includeSummary : true;
+        renameList: Array.isArray(config.renameList) ? config.renameList : [],
 
+        conditionalRename: {
+          enabled: !!config.conditionalRenameEnabled,
+          whenLhsType: config.conditionalRenameWhenLhsType || "msg",
+          whenLhs: config.conditionalRenameWhenLhs || "",
+          op: config.conditionalRenameOp || "==",
+          rhsType: config.conditionalRenameRhsType || "str",
+          rhs: config.conditionalRenameRhs || "",
+          list: Array.isArray(config.conditionalRenameList) ? config.conditionalRenameList : []
+        },
+
+        deriveList: Array.isArray(config.deriveList) ? config.deriveList : [],
+
+        output: {
+          targetType: config.outputTargetType || "msg",
+          targetPath: config.outputTargetPath || "filtered",
+          structure: config.structure || "hierarchical",
+          includeSummary: config.hasOwnProperty("includeSummary") ? !!config.includeSummary : true
+        }
+      });
+    }
+
+    function setRuntimeSchemaFromEmbedded() {
+      node.rt = embeddedToSchemaObj();
+    }
+
+    function setRuntimeSchemaFromFile(fileObj) {
+      // fileObj is the outer {version, updatedAt, schema}
+      const safe = withDefaults(fileObj?.schema || {});
+      node.rt = safe;
+    }
+
+    function loadFileToRuntime(showStatusOnError = true) {
+      try {
+        const p = resolveSafePath(node.configFilePath);
+        if (!fs.existsSync(p)) {
+          throw new Error("Config file not found.");
+        }
+        const txt = fs.readFileSync(p, "utf8");
+        const parsed = JSON.parse(txt);
+        setRuntimeSchemaFromFile(parsed);
+        node.status({ fill: "blue", shape: "dot", text: "config loaded" });
+        return true;
+      } catch (e) {
+        if (showStatusOnError) {
+          node.status({ fill: "red", shape: "ring", text: `config load failed: ${String(e.message || e)}` });
+        }
+        return false;
+      }
+    }
+
+    function startWatcher() {
+      if (!node.watchConfigFile || !node.configFilePath) return;
+      try {
+        const p = resolveSafePath(node.configFilePath);
+        if (!fs.existsSync(p)) return;
+        // clear previous
+        if (node._watcher) {
+          fs.unwatchFile(p, node._watcher);
+          node._watcher = null;
+        }
+        let timer = null;
+        const onChange = () => {
+          clearTimeout(timer);
+          timer = setTimeout(() => {
+            if (loadFileToRuntime(false)) {
+              node.status({ fill: "blue", shape: "dot", text: "config reloaded" });
+            }
+          }, 250);
+        };
+        fs.watchFile(p, { interval: 750 }, onChange);
+        node._watcher = onChange;
+      } catch (e) {
+        // ignore watcher errors
+      }
+    }
+
+    // Initialize runtime schema
+    if (node.useConfigFile && node.lockToFile && node.configFilePath) {
+      if (!loadFileToRuntime(true)) {
+        // fallback to embedded config
+        setRuntimeSchemaFromEmbedded();
+      }
+      startWatcher();
+    } else {
+      setRuntimeSchemaFromEmbedded();
+    }
+
+    // --------------- message processing ---------------
     node.on("input", async function(msg, send, done) {
+      const rt = node.rt || embeddedToSchemaObj();
       try {
         node.status({ fill: "blue", shape: "dot", text: "processing..." });
 
         // Resolve input object at inputPath
-        const inputRoot = getRootContainer(node, msg, node.inputPathType);
-        const inputData = inputRoot ? deepGet(inputRoot, node.inputPath) : undefined;
+        const inputRoot = getRootContainer(node, msg, rt.inputPathType);
+        const inputData = inputRoot ? deepGet(inputRoot, rt.inputPath) : undefined;
 
         // Expect { data: { file: { sheet: rows[] } }, ... }
         if (!inputData || typeof inputData !== "object" || !inputData.data) {
@@ -54,8 +274,8 @@ module.exports = function(RED) {
         }
 
         // Build regexes (sheet only)
-        const incSheet = safeRegex(node.includeSheetRegex);
-        const excSheet = safeRegex(node.excludeSheetRegex);
+        const incSheet = safeRegex(rt.includeSheetRegex);
+        const excSheet = safeRegex(rt.excludeSheetRegex);
 
         const resultMap = {};
         let fileCount = 0, sheetCount = 0, rowIn = 0, rowOut = 0;
@@ -74,10 +294,10 @@ module.exports = function(RED) {
             if (!Array.isArray(rows)) continue;
             rowIn += rows.length;
 
-            // 1) Row filters (async per row)
+            // 1) Row filters (async per row) — supports multiple columns in a single rule
             const filtered = [];
             for (const row of rows) {
-              if (await rowPasses(RED, node, row, msg, sheetName)) filtered.push(row);
+              if (await rowPasses(RED, rt, node, row, msg, sheetName)) filtered.push(row);
             }
 
             // 2) Transforms
@@ -85,40 +305,40 @@ module.exports = function(RED) {
             //    match the original headers present in the sheet.
             let transformed = filtered.map(r => ({ ...r }));
 
-            // 2a) Select keep/drop (sheet-scoped, dynamic column names)
-            if (node.selectMode !== "none" && Array.isArray(node.selectList) && node.selectList.length) {
-              const colSet = await buildScopedColumnSet(RED, node, msg, sheetName, node.selectList);
-              if (node.selectMode === "keep" && colSet.size) {
+            // 2a) Select keep/drop (sheet-scoped, dynamic column names; array-aware)
+            if (rt.selectMode !== "none" && Array.isArray(rt.selectList) && rt.selectList.length) {
+              const colSet = await buildScopedColumnSet(RED, rt, node, msg, sheetName, rt.selectList);
+              if (rt.selectMode === "keep" && colSet.size) {
                 transformed = transformed.map(r => pickSet(r, colSet));
-              } else if (node.selectMode === "drop" && colSet.size) {
+              } else if (rt.selectMode === "drop" && colSet.size) {
                 transformed = transformed.map(r => omitSet(r, colSet));
               }
             }
 
-            // 2b) Static rename (sheet-scoped)
-            if (Array.isArray(node.renameList) && node.renameList.length) {
+            // 2b) Static rename (sheet-scoped; arrays supported)
+            if (Array.isArray(rt.renameList) && rt.renameList.length) {
               const renamed = [];
               for (const r of transformed) {
-                renamed.push(await renameWithList(RED, node, r, msg, sheetName, node.renameList));
+                renamed.push(await renameWithList(RED, rt, node, r, msg, sheetName, rt.renameList));
               }
               transformed = renamed;
             }
 
             // 2c) Conditional rename (sheet-scoped, message-level condition)
-            if (node.conditionalRenameEnabled && await conditionTrue(RED, node, msg)) {
+            if (rt.conditionalRename.enabled && await conditionTrue(RED, rt, node, msg)) {
               const cRenamed = [];
               for (const r of transformed) {
-                cRenamed.push(await renameWithList(RED, node, r, msg, sheetName, node.conditionalRenameList));
+                cRenamed.push(await renameWithList(RED, rt, node, r, msg, sheetName, rt.conditionalRename.list));
               }
               transformed = cRenamed;
             }
 
             // 2d) Derive columns (JSONata)
-            if (Array.isArray(node.deriveList) && node.deriveList.length) {
+            if (Array.isArray(rt.deriveList) && rt.deriveList.length) {
               const derived = [];
               for (const r of transformed) {
                 const out = { ...r };
-                for (const d of node.deriveList) {
+                for (const d of rt.deriveList) {
                   if (!d || !d.col) continue;
                   if (d.exprType === "jsonata") {
                     try {
@@ -136,7 +356,7 @@ module.exports = function(RED) {
 
             rowOut += transformed.length;
 
-            if (node.structure === "hierarchical") {
+            if (rt.output.structure === "hierarchical") {
               resultMap[file] = resultMap[file] || {};
               resultMap[file][sheetName] = transformed;
             } else {
@@ -148,16 +368,16 @@ module.exports = function(RED) {
           }
         }
 
-        const outObj = (node.structure === "hierarchical")
+        const outObj = (rt.output.structure === "hierarchical")
           ? { data: resultMap }
           : { data: resultMap.__flat || [] };
 
-        if (node.includeSummary) {
+        if (rt.output.includeSummary) {
           outObj.summary = { fileCount, sheetCount, rowIn, rowOut, filteredRatio: rowIn ? (rowOut/rowIn) : null };
-          outObj.rules   = { logic: node.filterLogic, count: Array.isArray(node.rules) ? node.rules.length : 0 };
+          outObj.rules   = { logic: rt.filterLogic, count: Array.isArray(rt.rules) ? rt.rules.length : 0 };
         }
 
-        setOutput(RED, node, msg, outObj, node.outputTargetType, node.outputTargetPath);
+        setOutput(RED, node, msg, outObj, rt.output.targetType, rt.output.targetPath);
 
         node.status({ fill: "green", shape: "dot", text: `${rowOut}/${rowIn} rows` });
         send(msg);
@@ -168,11 +388,21 @@ module.exports = function(RED) {
         if (done) done(err);
       }
     });
+
+    node.on("close", function() {
+      try {
+        if (node._watcher && node.configFilePath) {
+          const p = resolveSafePath(node.configFilePath);
+          fs.unwatchFile(p, node._watcher);
+        }
+      } catch (e) {}
+      node._watcher = null;
+    });
   }
 
   RED.nodes.registerType("xlsx-filter", XlsxFilterNode);
 
-  // ---------- helpers (async-capable where needed) ----------
+  // ---------------- helpers used by runtime processing ----------------
 
   function sanitizeExpr(src) {
     // remove zero-width chars + the common right-arrow from copy/paste
@@ -222,7 +452,7 @@ module.exports = function(RED) {
     let rootObj = ctx.get(rootKey);
     if (typeof rootObj !== "object" || rootObj === null) rootObj = {};
     let cur = rootObj;
-    for (let i=0; i<parts.length-1; i++) {
+    for (let i=0;i<parts.length-1;i++) {
       const k = parts[i];
       if (typeof cur[k] !== "object" || cur[k] === null) cur[k] = {};
       cur = cur[k];
@@ -246,7 +476,7 @@ module.exports = function(RED) {
     });
   }
 
-  // Ensure value is an array (undefined/null -> [], scalar -> [scalar])
+  // Ensure array (undefined/null -> [], scalar -> [scalar], array -> same)
   function ensureArray(v) {
     if (Array.isArray(v)) return v;
     if (v === null || v === undefined) return [];
@@ -285,7 +515,7 @@ module.exports = function(RED) {
   function isEmpty(v) { return v == null || (typeof v === "string" && v.trim() === ""); }
 
   // Rules sheet-scope check (can contain jsonata sheet scope)
-  async function ruleAppliesTo(RED, node, msg, r, sheet, rowCtx) {
+  async function ruleAppliesTo(RED, rt, node, msg, r, sheet, rowCtx) {
     if (r.sheetScope) {
       const t = r.sheetScopeType || "str";
       if (t === "str") {
@@ -302,7 +532,7 @@ module.exports = function(RED) {
     return true;
   }
 
-  // Resolve column name and RHS (async where needed)
+  // Resolve column name(s) and RHS (async where needed)
   async function resolveColumnName(RED, node, msg, r, rowCtx, sheet) {
     return await resolveDynamic(RED, node, msg, r.col, r.colType, rowCtx, { sheet });
   }
@@ -310,12 +540,12 @@ module.exports = function(RED) {
     return await resolveDynamic(RED, node, msg, r.rhs, r.rhsType, rowCtx, { sheet });
   }
 
-  // Row filter evaluation (async) — NOW SUPPORTS MULTIPLE COLUMNS PER RULE
-  async function rowPasses(RED, node, row, msg, sheet) {
-    if (!Array.isArray(node.rules) || node.rules.length === 0) return true;
+  // Row filter evaluation (async) — supports multiple columns per rule
+  async function rowPasses(RED, rt, node, row, msg, sheet) {
+    if (!Array.isArray(rt.rules) || rt.rules.length === 0) return true;
 
     const evalRule = async (r) => {
-      if (!(await ruleAppliesTo(RED, node, msg, r, sheet, row))) return true;
+      if (!(await ruleAppliesTo(RED, rt, node, msg, r, sheet, row))) return true;
 
       // JSONata rule (per-row expression)
       if (r.op === "jsonata") {
@@ -374,13 +604,13 @@ module.exports = function(RED) {
       return false;
     };
 
-    if (node.filterLogic === "OR") {
-      for (const r of node.rules) {
+    if (rt.filterLogic === "OR") {
+      for (const r of rt.rules) {
         if (await evalRule(r)) return true;
       }
       return false;
     } else {
-      for (const r of node.rules) {
+      for (const r of rt.rules) {
         if (!(await evalRule(r))) return false;
       }
       return true;
@@ -388,10 +618,10 @@ module.exports = function(RED) {
   }
 
   // Build set of columns for current sheet based on selectList (async for jsonata, supports arrays)
-  async function buildScopedColumnSet(RED, node, msg, sheet, selectList) {
+  async function buildScopedColumnSet(RED, rt, node, msg, sheet, selectList) {
     const set = new Set();
     for (const it of (selectList || [])) {
-      if (!(await ruleAppliesTo(RED, node, msg, it, sheet, null))) continue;
+      if (!(await ruleAppliesTo(RED, rt, node, msg, it, sheet, null))) continue;
       const resolved = await resolveDynamic(RED, node, msg, it.col, it.colType, null, { sheet });
       const cols = ensureArray(resolved).map(c => String(c));
       for (const col of cols) if (col) set.add(col);
@@ -429,10 +659,10 @@ module.exports = function(RED) {
   }
 
   // RENAME using list entries (sheet-scoped + dynamic from/to) — supports arrays
-  async function renameWithList(RED, node, row, msg, sheet, list) {
+  async function renameWithList(RED, rt, node, row, msg, sheet, list) {
     let out = { ...row };
     for (const it of (list || [])) {
-      if (!(await ruleAppliesTo(RED, node, msg, it, sheet, row))) continue;
+      if (!(await ruleAppliesTo(RED, rt, node, msg, it, sheet, row))) continue;
 
       const fromRes = await resolveDynamic(RED, node, msg, it.from, it.fromType, row, { sheet });
       const toRes   = await resolveDynamic(RED, node, msg, it.to,   it.toType,   row, { sheet });
@@ -452,25 +682,19 @@ module.exports = function(RED) {
             delete out[from];
           }
         }
-      } else if (fromArr.length && !toArr.length) {
-        // Only from[] given → no-op
-        continue;
-      } else if (!fromArr.length && toArr.length) {
-        // Only to[] given → no-op
-        continue;
       }
     }
     return out;
   }
 
   // Conditional (message-level) — async
-  async function conditionTrue(RED, node, msg) {
+  async function conditionTrue(RED, rt, node, msg) {
     try {
-      const lhsVal = await resolveDynamic(RED, node, msg, node.conditionalRenameWhenLhs, node.conditionalRenameWhenLhsType);
-      const rhsVal = await resolveDynamic(RED, node, msg, node.conditionalRenameRhs, node.conditionalRenameRhsType);
+      const lhsVal = await resolveDynamic(RED, node, msg, rt.conditionalRename.whenLhs, rt.conditionalRename.whenLhsType);
+      const rhsVal = await resolveDynamic(RED, node, msg, rt.conditionalRename.rhs, rt.conditionalRename.rhsType);
       const L = coerceVal(lhsVal);
       const R = coerceVal(rhsVal);
-      switch (node.conditionalRenameOp) {
+      switch (rt.conditionalRename.op) {
         case "==": return L == R;
         case "!=": return L != R;
         case "contains":   return (typeof L === "string" && typeof R === "string") ? L.includes(R) : false;
