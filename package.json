@@ -1,6 +1,6 @@
 {
   "name": "node-red-contrib-xlsx-filter",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Filter & transform aggregated XLSX data (from xlsx-reader) using msg/flow/global/env/JSONata",
   "main": "xlsx-filter.js",
   "license": "MIT",
@@ -35,3 +35,4 @@
     "access": "public"
   }
 }
+
