@@ -60,7 +60,7 @@ Example: Keep columns whose names contain the current project diagram
 Select mode: Keep
 Select rows:
   Sheet:   Tarch
-  Column:  ($pd := $string(msg.data.const.projectDiagram);
+  Column:  ($pd := $string(msg.data.const.var1);
             $headers := $keys(msg.data.data.*.$lookup($, sheet)[0]);
             $headers[$contains($, $pd)])
   Column type: jsonata
@@ -79,15 +79,15 @@ Select rows:
 Common patterns:
 
 ```jsonata
-/* Dynamic column name: TL1_TLC1_<diagram> */
-"TL1_TLC1_" & $string(msg.data.const.projectDiagram)
+/* Dynamic column name: string_<var1> */
+"var1" & $string(msg.data.const.var1)
 
 /* Build a column from several variables */
 $string(msg.path.a) & "_" & $string($flow("b")) & "_" & $string($global("c"))
 
 /* Pick headers that contain a token */
 (
-  $t := "LIL";
+  $t := "string";
   $keys(row)[ $contains($, $t) ]
 )
 ```
@@ -191,7 +191,7 @@ When iterating files, the node **ignores** filenames starting with `~$` (Office 
 [{"id":"reader","type":"xlsx-reader","name":"read dir","path":"/data/xlsx","pathType":"str","mode":"directory","wires":[["filter"]]},
  {"id":"filter","type":"xlsx-filter","name":"keep LIL headers","inputPath":"data","inputPathType":"msg",
   "selectMode":"keep",
-  "selectList":[{"sheetScope":"Tarch","sheetScopeType":"str","col":"(\n  $pd := $string(msg.data.const.projectDiagram);\n  $headers := $keys(msg.data.data.*.$lookup($, sheet)[0]);\n  $headers[$contains($, $pd)]\n)","colType":"jsonata"}],
+  "selectList":[{"sheetScope":"Tarch","sheetScopeType":"str","col":"(\n  $pd := $string(msg.data.const.var1);\n  $headers := $keys(msg.data.data.*.$lookup($, sheet)[0]);\n  $headers[$contains($, $pd)]\n)","colType":"jsonata"}],
   "outputTargetType":"msg","outputTargetPath":"filtered","structure":"hierarchical","wires":[["debug"]]},
  {"id":"debug","type":"debug","complete":"true"}]
 ```
